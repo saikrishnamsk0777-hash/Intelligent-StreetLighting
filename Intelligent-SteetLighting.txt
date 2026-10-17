@@ -1,0 +1,435 @@
+#Intelligent-SteetLighting
+#include <WiFi.h>
+
+// ================= WIFI =================
+const char* ssid = "SmartPole";
+const char* password = "12345678";
+WiFiServer server(80);
+
+// ================= SENSORS =================
+#define LDR_PIN     34
+#define CURRENT_PIN 35
+
+// ================= POLE A =================
+#define PWR_A    4
+#define WIRE_A   32
+#define MAIN_A   23
+#define BACKUP_A 22
+#define G_A      21
+#define Y_A      19
+#define R_A      18
+
+// ================= POLE B =================
+#define PWR_B    15
+#define WIRE_B   33
+#define MAIN_B   25
+#define BACKUP_B 26
+#define G_B      2
+#define Y_B      27
+#define R_B      5
+
+// ================= GSM =================
+// SIM800L TXD -> ESP32 GPIO 13
+// SIM800L RXD <- ESP32 GPIO 14
+#define GSM_RX 13
+#define GSM_TX 14
+
+HardwareSerial gsm(2);
+const char PHONE_NUMBER[] = "+91××××××××××";
+
+// Track each pole independently
+bool previousFaultA = false;
+bool previousFaultB = false;
+
+// Retry GSM readiness checks if needed
+unsigned long lastGsmRetry = 0;
+const unsigned long GSM_RETRY_MS = 5000;
+
+// ================= GSM HELPERS =================
+String readGSM(unsigned long waitMs) {
+  String response;
+  unsigned long start = millis();
+
+  while (millis() - start < waitMs) {
+    while (gsm.available()) {
+      response += (char)gsm.read();
+    }
+    delay(2);
+  }
+
+  return response;
+}
+
+bool gsmCommandOK(const char* command,
+                  const char* expected,
+                  unsigned long waitMs = 2000) {
+  while (gsm.available()) gsm.read();
+
+  gsm.println(command);
+  String response = readGSM(waitMs);
+
+  Serial.print("GSM ");
+  Serial.print(command);
+  Serial.print(" -> ");
+  Serial.println(response);
+
+  return response.indexOf(expected) >= 0;
+}
+
+bool gsmReady() {
+  if (!gsmCommandOK("AT", "OK")) {
+    Serial.println("SIM800L not responding.");
+    return false;
+  }
+
+  if (!gsmCommandOK("AT+CPIN?", "READY")) {
+    Serial.println("SIM card not ready.");
+    return false;
+  }
+
+  if (!gsmCommandOK("AT+CREG?", "+CREG: 0,1") &&
+      !gsmCommandOK("AT+CREG?", "+CREG: 0,5")) {
+    Serial.println("SIM800L network registration not confirmed.");
+    return false;
+  }
+
+  return true;
+}
+
+// Send SMS. A +CMGS prompt is required before message text.
+bool sendSMS(const String& message) {
+  if (!gsmCommandOK("AT+CMGF=1", "OK")) {
+    return false;
+  }
+
+  while (gsm.available()) gsm.read();
+
+  gsm.print("AT+CMGS=\"");
+  gsm.print(PHONE_NUMBER);
+  gsm.println("\"");
+
+  String prompt = readGSM(3000);
+
+  if (prompt.indexOf(">") < 0) {
+    Serial.println("SMS prompt not received.");
+    Serial.println(prompt);
+    return false;
+  }
+
+  gsm.print(message);
+  gsm.write(26); // Ctrl+Z sends the SMS
+
+  String response = readGSM(15000);
+  Serial.println(response);
+
+  bool sent = response.indexOf("+CMGS:") >= 0 &&
+              response.indexOf("OK") >= 0;
+
+  Serial.println(sent ? "SMS submitted successfully."
+                      : "SMS sending not confirmed.");
+
+  return sent;
+}
+
+// Make one voice-call attempt
+bool makeCall() {
+  if (!gsmCommandOK("AT", "OK")) {
+    Serial.println("Call skipped: GSM not responding.");
+    return false;
+  }
+
+  while (gsm.available()) gsm.read();
+
+  gsm.print("ATD");
+  gsm.print(PHONE_NUMBER);
+  gsm.println(";");
+
+  String response = readGSM(2500);
+  Serial.print("Dial response: ");
+  Serial.println(response);
+
+  if (response.indexOf("ERROR") >= 0) {
+    Serial.println("Call command failed.");
+    return false;
+  }
+
+  Serial.println("Dial command sent.");
+  return true;
+}
+
+// Each new pole fault gets its own SMS.
+// A call is attempted for a wire fault on either pole.
+void handlePoleFault(const String& poleName) {
+  Serial.print("WIRE CUT: ");
+  Serial.println(poleName);
+
+  if (!gsmReady()) {
+    Serial.println("GSM unavailable; notification not confirmed.");
+    return;
+  }
+
+  String message = poleName + " in trouble";
+  sendSMS(message);
+  makeCall();
+}
+
+// ================= STATUS =================
+String getStatus(int powerPin, int wirePin) {
+  if (digitalRead(wirePin) == HIGH) return "WIRE CUT";
+  if (digitalRead(powerPin) == HIGH) return "POWER CUT";
+  return "NORMAL";
+}
+
+// ================= POLE CONTROL =================
+void controlPole(
+  int powerPin, int wirePin,
+  int mainPin, int backupPin,
+  int greenLED, int yellowLED, int redLED,
+  int brightness
+) {
+  bool powerState = digitalRead(powerPin);
+  bool wireState = digitalRead(wirePin);
+
+  if (wireState == HIGH) {
+    ledcWrite(mainPin, 0);
+    ledcWrite(backupPin, brightness);
+
+    digitalWrite(greenLED, LOW);
+    digitalWrite(yellowLED, LOW);
+    digitalWrite(redLED, HIGH);
+  } else if (powerState == LOW) {
+    ledcWrite(mainPin, brightness);
+    ledcWrite(backupPin, 0);
+
+    digitalWrite(greenLED, HIGH);
+    digitalWrite(yellowLED, LOW);
+    digitalWrite(redLED, LOW);
+  } else {
+    ledcWrite(mainPin, 0);
+    ledcWrite(backupPin, brightness);
+
+    digitalWrite(greenLED, LOW);
+    digitalWrite(yellowLED, HIGH);
+    digitalWrite(redLED, LOW);
+  }
+}
+
+// ================= ORIGINAL DASHBOARD UI =================
+String createDashboard(
+  int ldrValue, int brightness,
+  float current, float power,
+  String statusA, String statusB
+) {
+  String colorA = "normal";
+  if (statusA == "WIRE CUT") colorA = "wire";
+  else if (statusA == "POWER CUT") colorA = "power";
+
+  String colorB = "normal";
+  if (statusB == "WIRE CUT") colorB = "wire";
+  else if (statusB == "POWER CUT") colorB = "power";
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="1">
+<title>SmartPole Dashboard</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,sans-serif;background:#101820;color:white}
+.header{text-align:center;padding:25px 10px;background:#182630}
+.header h1{margin:0;font-size:30px}
+.header p{color:#aaa;margin-top:8px}
+.container{max-width:900px;margin:auto;padding:15px}
+.card{background:#1d2a35;margin:15px 0;padding:22px;border-radius:16px;box-shadow:0 4px 15px rgba(0,0,0,.3)}
+.card h2{margin-top:0}
+.status{font-size:25px;font-weight:bold;padding:15px;border-radius:10px;text-align:center}
+.normal{color:#00ff88;border:2px solid #00ff88}
+.power{color:#ffaa00;border:2px solid #ffaa00}
+.wire{color:#ff4444;border:2px solid #ff4444}
+.data{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.dataBox{background:#263744;padding:15px;border-radius:10px;text-align:center}
+.value{font-size:22px;font-weight:bold;margin-top:5px}
+.footer{text-align:center;color:#777;padding:20px}
+</style>
+</head>
+<body>
+<div class="header">
+<h1>SMART IoT STREETLIGHT</h1>
+<p>Intelligent Street Lighting System</p>
+</div>
+<div class="container">
+<div class="card">
+<h2>POLE A</h2>
+<div class="status )rawliteral";
+
+  html += colorA;
+  html += R"rawliteral(">)rawliteral";
+  html += statusA;
+  html += R"rawliteral(</div></div>
+<div class="card">
+<h2>POLE B</h2>
+<div class="status )rawliteral";
+
+  html += colorB;
+  html += R"rawliteral(">)rawliteral";
+  html += statusB;
+  html += R"rawliteral(</div></div>
+<div class="card">
+<h2>SYSTEM DATA</h2>
+<div class="data">
+<div class="dataBox">LDR VALUE<div class="value">)rawliteral";
+  html += String(ldrValue);
+  html += R"rawliteral(</div></div>
+<div class="dataBox">BRIGHTNESS<div class="value">)rawliteral";
+  html += String(brightness);
+  html += R"rawliteral( / 255</div></div>
+<div class="dataBox">CURRENT<div class="value">)rawliteral";
+  html += String(current, 2);
+  html += R"rawliteral( A</div></div>
+<div class="dataBox">POWER<div class="value">)rawliteral";
+  html += String(power, 2);
+  html += R"rawliteral( W</div></div>
+</div></div>
+<div class="footer">SMARTPOLE | ESP32 Local Monitoring</div>
+</div>
+</body>
+</html>
+)rawliteral";
+
+  return html;
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(PWR_A, INPUT_PULLUP);
+  pinMode(PWR_B, INPUT_PULLUP);
+  pinMode(WIRE_A, INPUT_PULLUP);
+  pinMode(WIRE_B, INPUT_PULLUP);
+
+  pinMode(G_A, OUTPUT);
+  pinMode(Y_A, OUTPUT);
+  pinMode(R_A, OUTPUT);
+  pinMode(G_B, OUTPUT);
+  pinMode(Y_B, OUTPUT);
+  pinMode(R_B, OUTPUT);
+
+  ledcAttach(MAIN_A, 5000, 8);
+  ledcAttach(BACKUP_A, 5000, 8);
+  ledcAttach(MAIN_B, 5000, 8);
+  ledcAttach(BACKUP_B, 5000, 8);
+
+  gsm.begin(9600, SERIAL_8N1, GSM_RX, GSM_TX);
+  delay(3000);
+
+  gsmCommandOK("AT", "OK");
+  gsmCommandOK("ATE0", "OK");
+  gsmCommandOK("AT+CMGF=1", "OK");
+
+  WiFi.mode(WIFI_AP);
+
+  if (WiFi.softAP(ssid, password)) {
+    Serial.println("WiFi AP Started");
+  } else {
+    Serial.println("WiFi AP FAILED");
+  }
+
+  server.begin();
+
+  Serial.println("SMARTPOLE STARTED");
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("Alert number: ");
+  Serial.println(PHONE_NUMBER);
+}
+
+// ================= LOOP =================
+void loop() {
+  int ldrValue = analogRead(LDR_PIN);
+
+  int brightness = map(ldrValue, 0, 4095, 40, 255);
+  brightness = constrain(brightness, 40, 255);
+
+  controlPole(PWR_A, WIRE_A, MAIN_A, BACKUP_A,
+              G_A, Y_A, R_A, brightness);
+
+  controlPole(PWR_B, WIRE_B, MAIN_B, BACKUP_B,
+              G_B, Y_B, R_B, brightness);
+
+  int raw = analogRead(CURRENT_PIN);
+  float voltage = raw * (3.3 / 4095.0);
+  float current = (voltage - 1.65) / 0.185;
+  if (current < 0) current = -current;
+  float power = 3.3 * current;
+
+  String statusA = getStatus(PWR_A, WIRE_A);
+  String statusB = getStatus(PWR_B, WIRE_B);
+
+  bool faultA = (statusA == "WIRE CUT");
+  bool faultB = (statusB == "WIRE CUT");
+
+  // Independent edge detection: each pole can alert separately.
+  if (faultA && !previousFaultA) {
+    handlePoleFault("Pole A");
+  }
+
+  if (faultB && !previousFaultB) {
+    handlePoleFault("Pole B");
+  }
+
+  previousFaultA = faultA;
+  previousFaultB = faultB;
+
+  // Serial diagnostics
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 2000) {
+    lastPrint = millis();
+    Serial.print("Pole A wire GPIO32: ");
+    Serial.print(digitalRead(WIRE_A));
+    Serial.print(" | Pole B wire GPIO33: ");
+    Serial.println(digitalRead(WIRE_B));
+    Serial.print("Pole A: ");
+    Serial.print(statusA);
+    Serial.print(" | Pole B: ");
+    Serial.println(statusB);
+  }
+
+  // Web server
+  WiFiClient client = server.available();
+
+  if (client) {
+    unsigned long timeout = millis();
+
+    while (!client.available() &&
+           client.connected() &&
+           millis() - timeout < 1500) {
+      delay(1);
+    }
+
+    if (client.available()) {
+      client.readStringUntil('\r');
+
+      String html = createDashboard(
+        ldrValue, brightness, current, power,
+        statusA, statusB
+      );
+
+      client.println("HTTP/1.1 200 OK");
+      client.println("Content-Type: text/html; charset=UTF-8");
+      client.println("Connection: close");
+      client.println("Cache-Control: no-cache");
+      client.println();
+      client.print(html);
+    }
+
+    client.stop();
+  }
+
+  delay(50);
+}
